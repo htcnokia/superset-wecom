@@ -503,7 +503,7 @@ SERVICE_WORKER_ASSET_URL = None
 
 LANGUAGES = {
     'zh': {'flag': 'cn', 'name': '简体中文'},
-    'zh_TW': {'flag': 'tw', 'name': '繁体中文'},
+    'zh_Hant_TW': {'flag': 'tw', 'name': '繁体中文'},
     'en': {'flag': 'us', 'name': 'English'},
 }
 BABEL_DEFAULT_LOCALE = 'zh'
