@@ -244,6 +244,22 @@ def translate_batch(texts, source_lang='en', target_lang='zh-CN', batch_size=20)
 
     return results
 
+import re
+
+def validate_placeholders(original, translated):
+    """确保翻译结果中包含原文的所有 %(xxx)s 占位符"""
+    orig_placeholders = re.findall(r'%\([^)]+\)[sdifFeEgGcrb%]', original)
+    trans_placeholders = re.findall(r'%\([^)]+\)[sdifFeEgGcrb%]', translated)
+    
+    if set(orig_placeholders) != set(trans_placeholders):
+        # 占位符不匹配，尝试修复：把缺失的占位符追加到翻译末尾
+        missing = set(orig_placeholders) - set(trans_placeholders)
+        if missing:
+            translated += ' ' + ' '.join(missing)
+        else:
+            # 翻译中多了占位符或格式不对，回退使用原文
+            return original
+    return translated
 
 # ==========================================
 # 3. OpenCC 简繁转换
@@ -376,10 +392,12 @@ def main():
                 translated = translations.get(original, '')
 
                 if translated and translated != original:
-                    # 还原 PO 转义
                     translated = translated.replace('\\"', '"').replace('\\\\', '\\')
+                    # 校验占位符
+                    translated = validate_placeholders(entry['msgid'], translated)
                     update_msgstr_in_raw_lines(entry, translated)
                     updated_count += 1
+
 
             print(f"  Successfully translated {updated_count}/{len(untranslated)} entries")
             rebuild_po(entries, target_po_path)
