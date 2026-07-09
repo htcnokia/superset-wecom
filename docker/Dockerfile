@@ -42,6 +42,11 @@ RUN . /app/.venv/bin/activate && \
     --translations-dir /app/superset/translations \
     --generate-zh-tw \
     --skip-translate
+    
+# 6.5 修复繁体中文路径映射问题，确保 zh_TW, zh_Hant_TW, zh-TW 都能找到文件
+RUN ln -s /app/superset/translations/zh_TW /app/superset/translations/zh_Hant_TW && \
+    ln -s /app/superset/translations/zh_TW /app/superset/translations/zh-TW
+
 
 # 7. 修复 service-worker.js 404
 RUN echo "// Superset 6.1.0 stub" > /app/superset/static/service-worker.js && \
