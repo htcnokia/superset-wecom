@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Superset 翻译自动补全脚本
-功能：
-  1. 扫描 .po 文件中未翻译的条目，调用 Google Translate 免费接口翻译
-  2. 基于简体中文用 OpenCC 生成台湾正体（zh_TW）
-  3. 编译 .po → .mo（后端）和 .po → .json（前端 JED 格式）
+Superset 翻译自动补全脚本（v2）
+以英文 .po 为基准，对比目标语言中缺失的条目，调用 Google Translate 翻译补全。
+支持：
+  - 基于英文翻译任意目标语言
+  - 用 OpenCC 从简体生成台湾正体（zh_TW）
+  - 编译 .po → .mo（后端）和 .po → .json（前端 JED 格式）
 
 用法：
-  python translate_po.py --translations-dir /app/superset/translations
+  # 补全简体中文
+  python translate_po.py --translations-dir /app/superset/translations --target-lang zh-CN --target-po zh
+
+  # 从简体生成繁体
+  python translate_po.py --translations-dir /app/superset/translations --generate-zh-tw
+
+  # 补全日语
+  python translate_po.py --translations-dir /app/superset/translations --target-lang ja --target-po ja
 """
 
 import os
@@ -19,218 +27,209 @@ import time
 import argparse
 import subprocess
 from pathlib import Path
+from copy import deepcopy
+
 
 # ==========================================
 # 1. PO 文件解析与写入
 # ==========================================
 
-def parse_po_file(filepath):
-    """解析 .po 文件，返回 (header, entries)
-    entries 是 list of dict: {msgid, msgstr, msgctxt, comment, references, flags, is_fuzzy}
+def parse_po_entries(filepath):
+    """
+    解析 .po 文件，返回 list of dict:
+    {
+        'msgid': str,
+        'msgstr': str,
+        'msgid_plural': str,
+        'msgstr_plural': dict,
+        'comments': list,       # 所有注释行（#, #: #. #）
+        'is_fuzzy': bool,
+        'is_header': bool,      # 第一个空 msgid 的 header 条目
+        'raw_block': str,       # 原始文本块（用于保留格式）
+    }
     """
     with open(filepath, 'r', encoding='utf-8') as f:
         content = f.read()
 
     entries = []
-    current = {
-        'comment': [],
-        'references': [],
-        'flags': [],
-        'msgctxt': '',
-        'msgid': '',
-        'msgid_plural': '',
-        'msgstr': '',
-        'msgstr_plural': {},
-        'is_fuzzy': False,
-        'raw_lines': []
-    }
+    blocks = re.split(r'\n\n+', content.strip())
 
-    lines = content.split('\n')
-    i = 0
+    for block in blocks:
+        lines = block.strip().split('\n')
+        if not lines:
+            continue
 
-    while i < len(lines):
-        line = lines[i]
+        entry = {
+            'msgid': '',
+            'msgstr': '',
+            'msgid_plural': '',
+            'msgstr_plural': {},
+            'comments': [],
+            'is_fuzzy': False,
+            'is_header': False,
+            'raw_block': block,
+        }
 
-        if line.startswith('#,'):
-            current['flags'].append(line[2:].strip())
-            if 'fuzzy' in line:
-                current['is_fuzzy'] = True
-            current['raw_lines'].append(line)
-        elif line.startswith('#:'):
-            current['references'].append(line[2:].strip())
-            current['raw_lines'].append(line)
-        elif line.startswith('#.'):
-            current['comment'].append(line[2:].strip())
-            current['raw_lines'].append(line)
-        elif line.startswith('#'):
-            current['raw_lines'].append(line)
-        elif line.startswith('msgctxt '):
-            current['msgctxt'] = extract_string(line)
-            current['raw_lines'].append(line)
-        elif line.startswith('msgid_plural '):
-            current['msgid_plural'] = extract_string(line)
-            current['raw_lines'].append(line)
-        elif line.startswith('msgid '):
-            current['msgid'] = extract_string(line)
-            current['raw_lines'].append(line)
-        elif line.startswith('msgstr['):
-            # plural form
-            match = re.match(r'msgstr\[(\d+)\]\s+"(.*)"', line)
-            if match:
-                idx = int(match.group(1))
-                val = match.group(2)
-                current['msgstr_plural'][idx] = val
-            current['raw_lines'].append(line)
-        elif line.startswith('msgstr '):
-            current['msgstr'] = extract_string(line)
-            current['raw_lines'].append(line)
-        elif line.startswith('"') and line.endswith('"'):
-            # continuation line
-            if current['raw_lines']:
-                current['raw_lines'][-1] += '\n' + line
-            # append to the last field
-            cont = line[1:-1]
-            if current['msgstr'] and not current['msgstr_plural']:
-                current['msgstr'] += cont
-            elif current['msgid'] and not current['msgstr'] and not current['msgstr_plural']:
-                current['msgid'] += cont
-            elif current['msgid_plural']:
-                current['msgid_plural'] += cont
-        elif line.strip() == '':
-            # blank line = entry separator
-            if current['msgid'] or current['msgstr'] or current['raw_lines']:
-                entries.append(current)
-            current = {
-                'comment': [],
-                'references': [],
-                'flags': [],
-                'msgctxt': '',
-                'msgid': '',
-                'msgid_plural': '',
-                'msgstr': '',
-                'msgstr_plural': {},
-                'is_fuzzy': False,
-                'raw_lines': []
-            }
-        else:
-            current['raw_lines'].append(line)
+        current_field = None
+        for line in lines:
+            if line.startswith('#'):
+                entry['comments'].append(line)
+                if 'fuzzy' in line:
+                    entry['is_fuzzy'] = True
+            elif line.startswith('msgid_plural '):
+                current_field = 'msgid_plural'
+                entry['msgid_plural'] = _extract_quoted(line)
+            elif line.startswith('msgid '):
+                current_field = 'msgid'
+                entry['msgid'] = _extract_quoted(line)
+            elif line.startswith('msgstr['):
+                current_field = 'msgstr_plural'
+                m = re.match(r'msgstr\[(\d+)\]\s+"(.*)"', line)
+                if m:
+                    entry['msgstr_plural'][int(m.group(1))] = _unescape(m.group(2))
+            elif line.startswith('msgstr '):
+                current_field = 'msgstr'
+                entry['msgstr'] = _extract_quoted(line)
+            elif line.startswith('"') and line.endswith('"'):
+                # continuation line
+                val = _unescape(line[1:-1])
+                if current_field == 'msgid':
+                    entry['msgid'] += val
+                elif current_field == 'msgstr':
+                    entry['msgstr'] += val
+                elif current_field == 'msgid_plural':
+                    entry['msgid_plural'] += val
+                elif current_field == 'msgstr_plural':
+                    # find the last plural index
+                    last_idx = max(entry['msgstr_plural'].keys()) if entry['msgstr_plural'] else 0
+                    entry['msgstr_plural'][last_idx] = entry['msgstr_plural'].get(last_idx, '') + val
 
-        i += 1
+        if not entry['msgid'] and not entry['msgstr']:
+            entry['is_header'] = True
 
-    # last entry
-    if current['msgid'] or current['msgstr'] or current['raw_lines']:
-        entries.append(current)
+        entries.append(entry)
 
     return entries
 
 
-def extract_string(line):
-    """从 msgid/msgstr 行中提取引号内的字符串"""
-    match = re.match(r'(?:msgctxt|msgid|msgid_plural|msgstr)\s+"(.*)"', line)
-    if match:
-        return match.group(1)
+def _extract_quoted(line):
+    """从 msgid/msgstr 行提取引号内内容并反转义"""
+    m = re.match(r'(?:msgid|msgid_plural|msgstr)\s+"(.*)"', line)
+    if m:
+        return _unescape(m.group(1))
     return ''
 
 
-def is_untranslated(entry):
-    """判断条目是否需要翻译"""
-    if not entry['msgid']:
+def _unescape(s):
+    """反转义 PO 字符串"""
+    return s.replace('\\"', '"').replace('\\\\', '\\').replace('\\n', '\n').replace('\\t', '\t')
+
+
+def _escape(s):
+    """转义字符串为 PO 格式"""
+    return s.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n').replace('\t', '\\t')
+
+
+def build_po_content(entries):
+    """将 entries 重新组装为 .po 文件内容"""
+    blocks = []
+    for entry in entries:
+        lines = []
+
+        # 注释
+        for c in entry['comments']:
+            # 去掉 fuzzy 标记（如果已经翻译了）
+            if not entry['is_fuzzy'] and c.startswith('#,'):
+                flags = [f.strip() for f in c[2:].split(',') if f.strip() != 'fuzzy']
+                if flags:
+                    lines.append('#, ' + ', '.join(flags))
+                # else: skip the fuzzy line
+            else:
+                lines.append(c)
+
+        # msgid
+        if entry['msgid']:
+            escaped = _escape(entry['msgid'])
+            if '\n' in entry['msgid'] and len(entry['msgid']) > 70:
+                lines.append('msgid ""')
+                for part in escaped.split('\\n'):
+                    if part:
+                        lines.append(f'"{part}\\n"')
+            else:
+                lines.append(f'msgid "{escaped}"')
+        else:
+            lines.append('msgid ""')
+
+        # msgid_plural
+        if entry['msgid_plural']:
+            lines.append(f'msgid_plural "{_escape(entry["msgid_plural"])}"')
+
+        # msgstr
+        if entry['msgstr_plural']:
+            for idx in sorted(entry['msgstr_plural'].keys()):
+                lines.append(f'msgstr[{idx}] "{_escape(entry["msgstr_plural"][idx])}"')
+        else:
+            lines.append(f'msgstr "{_escape(entry["msgstr"])}"')
+
+        blocks.append('\n'.join(lines))
+
+    return '\n\n'.join(blocks) + '\n'
+
+
+# ==========================================
+# 2. 翻译过滤逻辑
+# ==========================================
+
+def should_translate(msgid):
+    """判断一个 msgid 是否需要翻译"""
+    if not msgid or not msgid.strip():
         return False
-    
-    msgid = entry['msgid']
-    
-    # 跳过纯占位符（如 %(name)s）
-    if re.match(r'^[%\(\)\[\]{}s\d\s.,;:!?/\\@#$^&*+=<>|~`"\']+$', msgid):
+
+    # 跳过纯占位符 / 纯符号
+    if re.match(r'^[%\(\)\[\]{}s\d\s.,;:!?/\\@#$^&*+=<>|~`"\'+\-]+$', msgid):
         return False
-    
+
     # 跳过含 %(xxx)s 变量的条目（翻译容易破坏占位符格式）
     if re.search(r'%\([^)]+\)[sdifFeEgGcrb%]', msgid):
         return False
-    
+
     # 跳过含 {xxx} 格式变量的条目
     if re.search(r'\{[^}]+\}', msgid):
         return False
-    
+
     # 跳过纯数字、纯标点、纯空白
     if re.match(r'^[\d\s\W]+$', msgid):
         return False
-    
-    # 跳过 HTML/XML 标签（如 <br>、<div>）
-    if re.match(r'^<[^>]+>$', msgid):
+
+    # 跳过 HTML/XML 标签
+    if re.match(r'^<[^>]+>$', msgid.strip()):
         return False
-    
-    # 跳过 CSS 类名、JSON key 等技术标识符（全小写+下划线/连字符）
-    if re.match(r'^[a-z_\-]+$', msgid):
+
+    # 跳过 CSS 类名、JSON key 等技术标识符
+    if re.match(r'^[a-z_\-\.]+$', msgid):
         return False
-    
-    # msgstr 为空 或 与 msgid 完全相同（未翻译）
-    if not entry['msgstr']:
-        return True
-    if entry['msgstr'] == entry['msgid']:
-        return True
-    
-    return False
 
+    # 跳过纯大写缩写（如 API、SQL、CSV 等）
+    if re.match(r'^[A-Z]{1,6}$', msgid):
+        return False
 
+    # 跳过文件路径
+    if re.match(r'^[/\\]', msgid) or re.match(r'^[a-zA-Z]:\\', msgid):
+        return False
 
-def rebuild_po(entries, filepath):
-    """将 entries 重新写回 .po 文件"""
-    with open(filepath, 'w', encoding='utf-8') as f:
-        for i, entry in enumerate(entries):
-            for line in entry['raw_lines']:
-                f.write(line + '\n')
-            if i < len(entries) - 1:
-                f.write('\n')
+    # 跳过 URL
+    if re.match(r'^https?://', msgid):
+        return False
 
-
-def update_msgstr_in_raw_lines(entry, new_msgstr):
-    """更新 entry 的 raw_lines 中的 msgstr 值"""
-    escaped = new_msgstr.replace('\\', '\\\\').replace('"', '\\"')
-    new_lines = []
-    in_msgstr = False
-    msgstr_written = False
-
-    for line in entry['raw_lines']:
-        if line.startswith('msgstr '):
-            new_lines.append(f'msgstr "{escaped}"')
-            in_msgstr = True
-            msgstr_written = True
-        elif in_msgstr and line.startswith('"') and line.endswith('"'):
-            # skip continuation lines (we put everything in one line)
-            continue
-        else:
-            if in_msgstr and not line.startswith('"'):
-                in_msgstr = False
-            new_lines.append(line)
-
-    if not msgstr_written:
-        new_lines.append(f'msgstr "{escaped}"')
-
-    # remove fuzzy flag
-    cleaned = []
-    for line in new_lines:
-        if line.startswith('#,'):
-            flags = [f.strip() for f in line[2:].split(',') if f.strip() != 'fuzzy']
-            if flags:
-                cleaned.append('#, ' + ', '.join(flags))
-            # else: remove the line entirely
-        else:
-            cleaned.append(line)
-
-    entry['raw_lines'] = cleaned
-    entry['msgstr'] = new_msgstr
-    entry['is_fuzzy'] = False
+    return True
 
 
 # ==========================================
-# 2. Google Translate（免费接口）
+# 3. Google Translate
 # ==========================================
 
-def translate_batch(texts, source_lang='en', target_lang='zh-CN', batch_size=20):
-    """
-    使用 deep-translator 的 GoogleTranslator 批量翻译。
-    每次翻译 batch_size 条，避免触发限流。
-    """
+def translate_batch(texts, source_lang='en', target_lang='zh-CN', batch_size=15):
+    """批量翻译"""
     try:
         from deep_translator import GoogleTranslator
     except ImportError:
@@ -245,109 +244,88 @@ def translate_batch(texts, source_lang='en', target_lang='zh-CN', batch_size=20)
         batch = texts[i:i + batch_size]
         batch_num = i // batch_size + 1
         total_batches = (total + batch_size - 1) // batch_size
-        print(f"  Translating batch {batch_num}/{total_batches} ({len(batch)} items)...")
+        print(f"  Batch {batch_num}/{total_batches} ({len(batch)} items)...")
 
         try:
-            # deep-translator supports list input for batch translation
             translated = translator.translate_batch(batch)
             for original, translation in zip(batch, translated):
-                results[original] = translation
+                if translation:
+                    results[original] = translation
+                else:
+                    results[original] = original
         except Exception as e:
-            print(f"  Batch translation failed: {e}")
-            # fallback: translate one by one
+            print(f"  Batch failed: {e}, falling back to single translation...")
             for text in batch:
                 try:
                     result = translator.translate(text)
-                    results[text] = result
-                    time.sleep(0.3)
+                    results[text] = result if result else text
+                    time.sleep(0.5)
                 except Exception as e2:
-                    print(f"    Failed to translate: {text[:50]}... Error: {e2}")
-                    results[text] = text  # keep original
+                    print(f"    Failed: {text[:50]}... ({e2})")
+                    results[text] = text
 
-        # rate limiting
         if i + batch_size < total:
-            time.sleep(1)
+            time.sleep(1.5)
 
     return results
 
-import re
-
-def validate_placeholders(original, translated):
-    """确保翻译结果中包含原文的所有 %(xxx)s 占位符"""
-    orig_placeholders = re.findall(r'%\([^)]+\)[sdifFeEgGcrb%]', original)
-    trans_placeholders = re.findall(r'%\([^)]+\)[sdifFeEgGcrb%]', translated)
-    
-    if set(orig_placeholders) != set(trans_placeholders):
-        # 占位符不匹配，尝试修复：把缺失的占位符追加到翻译末尾
-        missing = set(orig_placeholders) - set(trans_placeholders)
-        if missing:
-            translated += ' ' + ' '.join(missing)
-        else:
-            # 翻译中多了占位符或格式不对，回退使用原文
-            return original
-    return translated
 
 # ==========================================
-# 3. OpenCC 简繁转换
+# 4. OpenCC 简繁转换
 # ==========================================
 
-def convert_s2t(po_filepath, output_filepath):
+def convert_s2t(source_po_path, output_po_path):
     """用 OpenCC 将简体 .po 转换为台湾正体"""
     import opencc
     converter = opencc.OpenCC('s2t')
 
-    with open(po_filepath, 'r', encoding='utf-8') as f:
-        content = f.read()
-
-    # 只转换 msgstr 部分，不转换 msgid（msgid 是英文原文）
-    entries = parse_po_file(po_filepath)
+    entries = parse_po_entries(source_po_path)
 
     for entry in entries:
+        if entry['is_header']:
+            # 修改头部语言标识
+            for i, c in enumerate(entry['comments']):
+                entry['comments'][i] = c.replace('Language: zh\\n', 'Language: zh_TW\\n')
+                entry['comments'][i] = entry['comments'][i].replace('Language: zh_CN\\n', 'Language: zh_TW\\n')
+            continue
+
         if entry['msgstr']:
             entry['msgstr'] = converter.convert(entry['msgstr'])
-            update_msgstr_in_raw_lines(entry, entry['msgstr'])
 
-    # 修改头部语言标识
-    for entry in entries:
-        for j, line in enumerate(entry['raw_lines']):
-            if '"Language: zh\\n"' in line or '"Language: zh_CN\\n"' in line:
-                entry['raw_lines'][j] = line.replace('zh\\n', 'zh_TW\\n').replace('zh_CN\\n', 'zh_TW\\n')
-            if '"Language-Team: zh' in line:
-                entry['raw_lines'][j] = re.sub(
-                    r'Language-Team: zh[^\\]*',
-                    'Language-Team: zh_TW',
-                    line
-                )
+        for idx in entry['msgstr_plural']:
+            if entry['msgstr_plural'][idx]:
+                entry['msgstr_plural'][idx] = converter.convert(entry['msgstr_plural'][idx])
 
-    rebuild_po(entries, output_filepath)
-    print(f"  Converted {po_filepath} → {output_filepath} (s2t)")
+    content = build_po_content(entries)
+    os.makedirs(os.path.dirname(output_po_path), exist_ok=True)
+    with open(output_po_path, 'w', encoding='utf-8') as f:
+        f.write(content)
+
+    print(f"  ✓ Converted {source_po_path} → {output_po_path} (s2t)")
 
 
 # ==========================================
-# 4. 编译 .po → .mo 和 .po → .json
+# 5. 编译
 # ==========================================
 
 def compile_mo(translations_dir):
-    """编译所有 .po 为 .mo"""
-    print("\n[3/4] Compiling .po → .mo ...")
+    print("\n[Compiling .po → .mo]")
     result = subprocess.run(
         ['pybabel', 'compile', '-d', translations_dir],
         capture_output=True, text=True
     )
     if result.returncode == 0:
-        print("  .mo compilation successful")
+        print("  ✓ .mo compilation successful")
     else:
-        print(f"  .mo compilation warnings (non-fatal):\n{result.stderr[:500]}")
+        print(f"  ⚠ .mo warnings (non-fatal): {result.stderr[:300]}")
 
 
 def compile_json(translations_dir):
-    """编译所有 .po 为 .json（JED 格式）"""
-    print("\n[4/4] Compiling .po → .json (JED format) ...")
+    print("\n[Compiling .po → .json (JED format)]")
     po_files = list(Path(translations_dir).rglob('messages.po'))
 
-    for po_file in po_files:
+    for po_file in sorted(po_files):
         json_file = po_file.with_suffix('.json')
-        # 删除旧的 json
         if json_file.exists():
             json_file.unlink()
 
@@ -356,95 +334,146 @@ def compile_json(translations_dir):
              str(po_file), str(json_file)],
             capture_output=True, text=True
         )
+        lang = po_file.parent.parent.name
         if result.returncode == 0:
-            print(f"  ✓ {po_file.parent.name}/messages.json")
-            # prettier 格式化（可选）
+            print(f"  ✓ {lang}/messages.json")
             subprocess.run(['prettier', '--write', str(json_file)],
                          capture_output=True, text=True)
         else:
-            print(f"  ✗ {po_file.parent.name}: {result.stderr[:200]}")
+            print(f"  ✗ {lang}: {result.stderr[:200]}")
 
 
 # ==========================================
-# 5. 主流程
+# 6. 主流程
 # ==========================================
 
 def main():
-    parser = argparse.ArgumentParser(description='Superset translation auto-completion')
-    parser.add_argument('--translations-dir', required=True, help='Path to translations directory')
-    parser.add_argument('--source-lang', default='en', help='Source language (default: en)')
-    parser.add_argument('--target-lang', default='zh-CN', help='Target language for Google Translate (default: zh-CN)')
-    parser.add_argument('--target-po', default='zh', help='Target .po directory name (default: zh)')
+    parser = argparse.ArgumentParser(description='Superset translation auto-completion (v2)')
+    parser.add_argument('--translations-dir', required=True)
+    parser.add_argument('--source-po', default='en', help='Source .po directory name (default: en)')
+    parser.add_argument('--target-po', default=None, help='Target .po directory name (e.g. zh, ja, ko)')
+    parser.add_argument('--target-lang', default=None, help='Google Translate target language code (e.g. zh-CN, ja, ko)')
     parser.add_argument('--generate-zh-tw', action='store_true', help='Generate zh_TW from zh using OpenCC')
-    parser.add_argument('--batch-size', type=int, default=20, help='Translation batch size (default: 20)')
+    parser.add_argument('--batch-size', type=int, default=15)
     parser.add_argument('--skip-translate', action='store_true', help='Skip translation, only compile')
     args = parser.parse_args()
 
-    translations_dir = args.translations_dir
-    target_po_dir = args.target_po
-    target_po_path = os.path.join(translations_dir, target_po_dir, 'LC_MESSAGES', 'messages.po')
+    td = args.translations_dir
+    en_po_path = os.path.join(td, args.source_po, 'LC_MESSAGES', 'messages.po')
 
-    if not os.path.exists(target_po_path):
-        print(f"ERROR: {target_po_path} not found")
+    if not os.path.exists(en_po_path):
+        print(f"ERROR: English source not found: {en_po_path}")
         sys.exit(1)
 
-    # ---- Step 1: 翻译未翻译的条目 ----
-    if not args.skip_translate:
-        print(f"\n[1/4] Scanning {target_po_path} for untranslated entries...")
-        entries = parse_po_file(target_po_path)
+    # ---- Step 1: 解析英文基准 ----
+    print(f"\n[1] Parsing English source: {en_po_path}")
+    en_entries = parse_po_entries(en_po_path)
+    en_map = {}
+    for entry in en_entries:
+        if entry['msgid'] and not entry['is_header']:
+            en_map[entry['msgid']] = entry
+    print(f"  Found {len(en_map)} translatable entries in English")
 
-        untranslated = []
-        untranslated_indices = []
-        for i, entry in enumerate(entries):
-            if is_untranslated(entry):
-                untranslated.append(entry['msgid'])
-                untranslated_indices.append(i)
+    # ---- Step 2: 翻译目标语言 ----
+    if args.target_po and args.target_lang and not args.skip_translate:
+        target_po_path = os.path.join(td, args.target_po, 'LC_MESSAGES', 'messages.po')
 
-        print(f"  Found {len(untranslated)} untranslated entries")
+        if not os.path.exists(target_po_path):
+            print(f"\n[2] Target .po not found, creating from English template: {target_po_path}")
+            os.makedirs(os.path.dirname(target_po_path), exist_ok=True)
+            # 复制英文作为模板
+            import shutil
+            shutil.copy2(en_po_path, target_po_path)
+            # 清空所有 msgstr
+            entries = parse_po_entries(target_po_path)
+            for entry in entries:
+                if not entry['is_header']:
+                    entry['msgstr'] = ''
+                    entry['msgstr_plural'] = {}
+            with open(target_po_path, 'w', encoding='utf-8') as f:
+                f.write(build_po_content(entries))
 
-        if untranslated:
-            print(f"\n[2/4] Translating {len(untranslated)} entries ({args.source_lang} → {args.target_lang})...")
+        print(f"\n[2] Comparing English vs {args.target_po}...")
+        target_entries = parse_po_entries(target_po_path)
+        target_map = {}
+        for entry in target_entries:
+            if entry['msgid'] and not entry['is_header']:
+                target_map[entry['msgid']] = entry
+
+        # 找出需要翻译的条目
+        to_translate = []
+        for msgid in en_map:
+            if not should_translate(msgid):
+                continue
+            if msgid not in target_map:
+                # 英文有但目标语言完全没有这个条目
+                to_translate.append(msgid)
+            elif not target_map[msgid]['msgstr'] or target_map[msgid]['msgstr'] == msgid:
+                # 有条目但 msgstr 为空或与原文相同
+                to_translate.append(msgid)
+
+        print(f"  Need to translate: {len(to_translate)} entries")
+
+        if to_translate:
+            print(f"\n[3] Translating {len(to_translate)} entries (en → {args.target_lang})...")
             translations = translate_batch(
-                untranslated,
-                source_lang=args.source_lang,
+                to_translate,
+                source_lang='en',
                 target_lang=args.target_lang,
                 batch_size=args.batch_size
             )
 
-            updated_count = 0
-            for idx in untranslated_indices:
-                entry = entries[idx]
-                original = entry['msgid']
-                translated = translations.get(original, '')
+            updated = 0
+            for msgid in to_translate:
+                translated = translations.get(msgid, '')
+                if translated and translated != msgid:
+                    if msgid in target_map:
+                        target_map[msgid]['msgstr'] = translated
+                        target_map[msgid]['is_fuzzy'] = False
+                    else:
+                        # 新增条目
+                        new_entry = {
+                            'msgid': msgid,
+                            'msgstr': translated,
+                            'msgid_plural': en_map[msgid].get('msgid_plural', ''),
+                            'msgstr_plural': {},
+                            'comments': en_map[msgid].get('comments', []),
+                            'is_fuzzy': False,
+                            'is_header': False,
+                            'raw_block': '',
+                        }
+                        target_entries.append(new_entry)
+                        target_map[msgid] = new_entry
+                    updated += 1
 
-                if translated and translated != original:
-                    translated = translated.replace('\\"', '"').replace('\\\\', '\\')
-                    # 校验占位符
-                    translated = validate_placeholders(entry['msgid'], translated)
-                    update_msgstr_in_raw_lines(entry, translated)
-                    updated_count += 1
+            print(f"  ✓ Translated {updated}/{len(to_translate)} entries")
 
-
-            print(f"  Successfully translated {updated_count}/{len(untranslated)} entries")
-            rebuild_po(entries, target_po_path)
-            print(f"  Saved to {target_po_path}")
+            # 写回文件
+            with open(target_po_path, 'w', encoding='utf-8') as f:
+                f.write(build_po_content(target_entries))
+            print(f"  ✓ Saved to {target_po_path}")
         else:
-            print("  All entries already translated, skipping...")
-    else:
-        print("\n[1/4] Skipping translation (--skip-translate)")
-        print("[2/4] Skipping translation (--skip-translate)")
+            print("  All entries already translated!")
 
-    # ---- Step 2: 生成繁体中文 ----
+    elif args.skip_translate:
+        print("\n[2-3] Skipping translation (--skip-translate)")
+
+    # ---- Step 4: 生成繁体中文 ----
     if args.generate_zh_tw:
-        print(f"\n[2.5/4] Generating zh_TW from {target_po_dir} using OpenCC...")
-        zh_tw_dir = os.path.join(translations_dir, 'zh_TW', 'LC_MESSAGES')
-        os.makedirs(zh_tw_dir, exist_ok=True)
-        zh_tw_po = os.path.join(zh_tw_dir, 'messages.po')
-        convert_s2t(target_po_path, zh_tw_po)
+        print(f"\n[4] Generating zh_TW from zh using OpenCC...")
+        zh_po = os.path.join(td, 'zh', 'LC_MESSAGES', 'messages.po')
+        zh_tw_po = os.path.join(td, 'zh_TW', 'LC_MESSAGES', 'messages.po')
 
-    # ---- Step 3 & 4: 编译 ----
-    compile_mo(translations_dir)
-    compile_json(translations_dir)
+        if not os.path.exists(zh_po):
+            print(f"  ERROR: zh source not found: {zh_po}")
+        else:
+            convert_s2t(zh_po, zh_tw_po)
+    else:
+        print("\n[4] Skipping zh_TW generation (use --generate-zh-tw to enable)")
+
+    # ---- Step 5 & 6: 编译 ----
+    compile_mo(td)
+    compile_json(td)
 
     print("\n✅ All done! Restart Superset to apply changes.")
 
