@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     npm install -g po2json prettier && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# 2. Python 依赖（含翻译库 + OpenCC + Babel）
+# 2. Python 依赖
 RUN . /app/.venv/bin/activate && \
     uv pip install --no-cache-dir \
     pyodbc pymssql psycopg2-binary pymysql sqlalchemy-trino \
@@ -27,17 +27,23 @@ RUN echo "[ODBC Driver 18 for SQL Server]" > /etc/odbcinst.ini \
 # 4. 复制翻译脚本
 COPY scripts/translate_po.py /app/scripts/translate_po.py
 
-# 5. 自动翻译 + 简繁转换 + 编译
+# 5. 基于英文补全简体中文翻译
 RUN . /app/.venv/bin/activate && \
     python /app/scripts/translate_po.py \
     --translations-dir /app/superset/translations \
-    --source-lang en \
-    --target-lang zh-CN \
+    --source-po en \
     --target-po zh \
-    --generate-zh-tw \
-    --batch-size 20
+    --target-lang zh-CN \
+    --batch-size 15
 
-# 6. 修复 service-worker.js 404
+# 6. 从简体中文生成繁体中文
+RUN . /app/.venv/bin/activate && \
+    python /app/scripts/translate_po.py \
+    --translations-dir /app/superset/translations \
+    --generate-zh-tw \
+    --skip-translate
+
+# 7. 修复 service-worker.js 404
 RUN echo "// Superset 6.1.0 stub" > /app/superset/static/service-worker.js && \
     chown superset:superset /app/superset/static/service-worker.js
 
