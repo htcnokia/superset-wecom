@@ -527,3 +527,53 @@ DB_PORT = os.environ.get("POSTGRES_PORT")
 DB_NAME = os.environ.get("POSTGRES_DB")
 
 SQLALCHEMY_DATABASE_URI = f'postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}'
+
+# ==========================================
+# 9. 修复 zh_TW 繁体中文加载问题（Superset bug #34084）
+# ==========================================
+# Superset 的 language_pack 端点会把 zh_TW 规范化为 zh，导致加载简体翻译
+# 通过 monkey-patch 强制让 zh_TW 正确加载繁体翻译文件
+
+def patch_zh_tw_locale():
+    """修复 zh_TW locale 映射问题"""
+    try:
+        from superset.views import base as superset_base
+        from flask import request, jsonify
+        import json
+        import os
+
+        # 保存原始的 language_pack 方法
+        original_language_pack = None
+        for rule in superset_base.app.url_map.iter_rules():
+            if 'language_pack' in str(rule):
+                original_language_pack = superset_base.app.view_functions.get(rule.endpoint)
+                break
+
+        if original_language_pack:
+            @superset_base.app.route('/superset/language_pack/<lang>/', methods=['GET'])
+            def patched_language_pack(lang):
+                """修复后的 language_pack 端点"""
+                # 如果是 zh_TW，直接加载繁体翻译文件
+                if lang == 'zh_TW':
+                    zh_tw_json_path = '/app/superset/translations/zh_TW/LC_MESSAGES/messages.json'
+                    if os.path.exists(zh_tw_json_path):
+                        with open(zh_tw_json_path, 'r', encoding='utf-8') as f:
+                            lang_pack = json.load(f)
+                        return jsonify(lang_pack)
+                
+                # 其他语言走原始逻辑
+                return original_language_pack(lang)
+
+            print("✅ Patched language_pack endpoint for zh_TW")
+    except Exception as e:
+        print(f"⚠️ Failed to patch zh_TW locale: {e}")
+
+# 延迟执行 patch（等待 Flask app 初始化完成）
+import threading
+def delayed_patch():
+    import time
+    time.sleep(2)  # 等待 app 初始化
+    patch_zh_tw_locale()
+
+threading.Thread(target=delayed_patch, daemon=True).start()
+
