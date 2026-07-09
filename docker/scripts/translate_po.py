@@ -133,18 +133,44 @@ def extract_string(line):
 
 
 def is_untranslated(entry):
-    """判断条目是否未翻译"""
+    """判断条目是否需要翻译"""
     if not entry['msgid']:
         return False
+    
+    msgid = entry['msgid']
+    
     # 跳过纯占位符（如 %(name)s）
-    if re.match(r'^[%\(\)\[\]{}s\d\s.,;:!?/\\@#$^&*+=<>|~`"\']+$', entry['msgid']):
+    if re.match(r'^[%\(\)\[\]{}s\d\s.,;:!?/\\@#$^&*+=<>|~`"\']+$', msgid):
         return False
+    
+    # 跳过含 %(xxx)s 变量的条目（翻译容易破坏占位符格式）
+    if re.search(r'%\([^)]+\)[sdifFeEgGcrb%]', msgid):
+        return False
+    
+    # 跳过含 {xxx} 格式变量的条目
+    if re.search(r'\{[^}]+\}', msgid):
+        return False
+    
+    # 跳过纯数字、纯标点、纯空白
+    if re.match(r'^[\d\s\W]+$', msgid):
+        return False
+    
+    # 跳过 HTML/XML 标签（如 <br>、<div>）
+    if re.match(r'^<[^>]+>$', msgid):
+        return False
+    
+    # 跳过 CSS 类名、JSON key 等技术标识符（全小写+下划线/连字符）
+    if re.match(r'^[a-z_\-]+$', msgid):
+        return False
+    
     # msgstr 为空 或 与 msgid 完全相同（未翻译）
     if not entry['msgstr']:
         return True
     if entry['msgstr'] == entry['msgid']:
         return True
+    
     return False
+
 
 
 def rebuild_po(entries, filepath):
