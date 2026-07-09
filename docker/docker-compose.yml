@@ -1,0 +1,123 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: superset_cache
+    restart: unless-stopped
+    volumes:
+      - redis_data_sp:/data
+
+  db:
+    image: postgres:17-alpine
+    container_name: superset_db
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "5443:5432"
+    volumes:
+      - db_home_sp:/var/lib/postgresql/data
+
+  # 🚀 自动化初始化容器 docker compose --profile init up -d
+  superset-init:
+    build: .
+    container_name: superset_init
+    profiles:
+      - init
+    env_file: .env
+    depends_on:
+      db:
+        condition: service_started
+      redis:
+        condition: service_started
+    user: "superset"
+    volumes:
+      - superset_home_sp:/app/superset_home
+      - ./superset_config.py:/app/pythonpath/superset_config.py      
+    command: >
+      bash -c "
+      echo '==== 1. 正在运行数据库迁移（建表） ====' &&
+      superset db upgrade &&
+      echo '==== 2. 正在创建管理员账号 ====' &&
+      superset fab create-admin --username admin --firstname Admin --lastname User --email '$$SUPERSET_ADMIN_MAIL' --password '$$SUPERSET_ADMIN_PASSWORD' &&      
+      echo '==== 3. 正在初始化角色和权限 ====' &&
+      superset init &&
+      echo '==== 🎉 所有初始化工作已完美结束 ===='
+      "
+
+  # 🌐 Superset 主 Web 服务容器
+  superset:
+    build: .
+    container_name: superset_app
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8690:8088"
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - SUPERSET_ENABLE_MCP=${SUPERSET_ENABLE_MCP}
+      - OPENAI_API_BASE=${OPENAI_API_BASE}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - SUPERSET_AI_MODEL=${SUPERSET_AI_MODEL}
+      - SERVICE_WORKER_ASSET_URL=${SERVICE_WORKER_ASSET_URL}
+    depends_on:
+      - db
+      - redis
+    volumes:
+      - superset_home_sp:/app/superset_home
+      - ./superset_config.py:/app/pythonpath/superset_config.py
+      - ./kingsops.png:/app/superset/static/assets/images/superset-logo-horiz.png
+     
+  # ⚙️ Celery 异步任务执行节点
+  superset-worker:
+    build: .
+    container_name: superset_worker
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+    command: ["celery", "--app=superset.tasks.celery_app:app", "worker", "--pool=prefork"]
+    depends_on:
+      - db
+      - redis
+    volumes:
+      - superset_home_sp:/app/superset_home
+      - ./superset_config.py:/app/pythonpath/superset_config.py
+      - ./kingsops.png:/app/superset/static/assets/images/superset-logo-horiz.png      
+    healthcheck:
+      test: ["CMD-SHELL", "ps aux | grep 'celery' | grep -q 'worker' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ⏱️ Celery 定时任务调度器
+  superset-worker-beat:
+    build: .
+    container_name: superset_worker_beat
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - ./kingsops.png:/app/superset/static/assets/images/superset-logo-horiz.png      
+    command: ["celery", "--app=superset.tasks.celery_app:app", "beat", "-s", "/app/superset_home/celerybeat-schedule"]
+    depends_on:
+      - db
+      - redis
+    volumes:
+      - superset_home_sp:/app/superset_home
+      - ./superset_config.py:/app/pythonpath/superset_config.py
+    healthcheck:
+      test: ["CMD-SHELL", "ps aux | grep 'celery' | grep -q 'beat' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  superset_home_sp:
+    driver: local
+  db_home_sp:
+    driver: local
+  redis_data_sp:
+    driver: local
