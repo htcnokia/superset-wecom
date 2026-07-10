@@ -180,11 +180,43 @@ def build_po_content(entries):
 # 2. 翻译过滤逻辑
 # ==========================================
 
-def should_translate(msgid):
+# 预定义一份核心黑名单，防止网络下载失败时也能覆盖最关键的词
+CORE_DO_NOT_TRANSLATE = {
+    '10000', 'DELETE', 'ECharts', 'EMAIL_REPORTS_CTA', 'GROUP BY',
+    'NOT GROUPED BY', 'OVERWRITE', 'TEMPORAL_RANGE', 'WFS', 'WMS',
+    'XYZ', 'bolt', 'crontab', 'error_message', 'pivoted_xlsx',
+    'schema1,schema2', 'sql', 'step-after', 'step-before',
+    'superset.example.com', 'your-project-1234-a1',
+    'deck.gl Geojson', 'dttm', 'p1', 'p5', 'p95', 'p99'
+}
+
+def load_do_not_translate(file_path):
+    """从本地文件加载黑名单"""
+    blacklist = set(CORE_DO_NOT_TRANSLATE)
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    # 跳过注释和空行
+                    if line and not line.startswith('#'):
+                        blacklist.add(line)
+            print(f"  ✓ Loaded {len(blacklist)} entries from do-not-translate.txt")
+        except Exception as e:
+            print(f"  ⚠ Failed to read do-not-translate.txt: {e}")
+    return blacklist
+
+
+
+def should_translate(msgid, blacklist=None):
     """判断一个 msgid 是否需要翻译"""
     if not msgid or not msgid.strip():
         return False
-
+        
+    # --- 新增：黑名单匹配 ---
+    if blacklist and msgid in blacklist:
+        return False
+    # -----------------------
     # 跳过纯占位符 / 纯符号
     if re.match(r'^[%\(\)\[\]{}s\d\s.,;:!?/\\@#$^&*+=<>|~`"\'+\-]+$', msgid):
         return False
@@ -359,6 +391,11 @@ def main():
     args = parser.parse_args()
 
     td = args.translations_dir
+    
+    # --- 新增：加载黑名单 ---
+    blacklist_path = os.path.join(td, 'do-not-translate.txt')
+    blacklist = load_do_not_translate(blacklist_path)
+    
     en_po_path = os.path.join(td, args.source_po, 'LC_MESSAGES', 'messages.po')
 
     if not os.path.exists(en_po_path):
@@ -403,7 +440,8 @@ def main():
         # 找出需要翻译的条目
         to_translate = []
         for msgid in en_map:
-            if not should_translate(msgid):
+            #翻译黑名单    
+            if not should_translate(msgid, blacklist=blacklist):
                 continue
             if msgid not in target_map:
                 # 英文有但目标语言完全没有这个条目
