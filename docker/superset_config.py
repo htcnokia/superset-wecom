@@ -422,8 +422,25 @@ class CustomSecurityManager(SupersetSecurityManager):
 
         @self.appbuilder.app.route('/auth/wecom-client-login', methods=['GET'])
         def wecom_client_login():
-            """企业微信客户端内自动静默授权登录（走 FAB 标准 OAuth 流程）"""
-            return redirect(url_for('AuthOAuthView.login', provider='wecom'))
+            """企业微信客户端内静默授权，自行构造授权 URL 并回调到自定义接口"""
+            from urllib.parse import urlencode
+
+            # 静默授权地址（注意：必须是 open.weixin.qq.com，末尾要加 #wechat_redirect）
+            base_url = 'https://open.weixin.qq.com/connect/oauth2/authorize'
+
+            # 回调地址统一使用您已有的扫码回调（确保与企业在后台配置的可信域名一致）
+            redirect_uri = request.host_url.rstrip('/') + '/auth/wecom-callback'
+
+            params = {
+                'appid': WECOM_CORP_ID,          # 这里填企业 corpid
+                'redirect_uri': redirect_uri,
+                'response_type': 'code',
+                'scope': 'snsapi_base',          # 静默授权，不需要用户确认
+                'state': 'wecom_client_login',
+            }
+            auth_url = f"{base_url}?{urlencode(params)}#wechat_redirect"
+
+            return redirect(auth_url)
 
     def oauth_user_info(self, provider, response=None):
         """企业微信 OAuth 用户信息获取（客户端内静默授权走此路径）"""
@@ -503,7 +520,7 @@ SERVICE_WORKER_ASSET_URL = None
 
 LANGUAGES = {
     'zh': {'flag': 'cn', 'name': '简体中文'},
-    'zh_Hant_TW': {'flag': 'tw', 'name': '繁体中文'},
+    'zh_TW': {'flag': 'tw', 'name': '繁体中文'},
     'en': {'flag': 'us', 'name': 'English'},
 }
 BABEL_DEFAULT_LOCALE = 'zh'
@@ -528,12 +545,4 @@ DB_NAME = os.environ.get("POSTGRES_DB")
 
 SQLALCHEMY_DATABASE_URI = f'postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}'
 
-# 延迟执行 patch（等待 Flask app 初始化完成）
-import threading
-def delayed_patch():
-    import time
-    time.sleep(2)  # 等待 app 初始化
-    patch_zh_tw_locale()
-
-threading.Thread(target=delayed_patch, daemon=True).start()
-
+APP_NAME="BI"
