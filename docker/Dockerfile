@@ -31,7 +31,7 @@ COPY scripts/translate_po.py /app/scripts/translate_po.py
 RUN curl -L https://raw.githubusercontent.com/apache/superset/master/superset/translations/en/LC_MESSAGES/messages.po \
     -o /app/superset/translations/en/LC_MESSAGES/messages.po
     
-# 5.0 基于英文补全简体中文翻译
+# 5.1 基于英文补全简体中文翻译
 RUN . /app/.venv/bin/activate && \
     python /app/scripts/translate_po.py \
     --translations-dir /app/superset/translations \
@@ -47,9 +47,11 @@ RUN . /app/.venv/bin/activate && \
     --generate-zh-tw \
     --skip-translate
     
-# 6.5 修复繁体中文路径映射问题，确保 zh_TW, zh_Hant_TW, zh-TW 都能找到文件
+# 6.1 修复繁体中文路径映射问题，确保 zh_TW, zh_Hant_TW, zh-TW 都能找到文件
 RUN ln -s /app/superset/translations/zh_TW /app/superset/translations/zh_Hant_TW && \
-    ln -s /app/superset/translations/zh_TW /app/superset/translations/zh-TW
+    ln -s /app/superset/translations/zh_TW /app/superset/translations/zh-TW && \
+    ln -s /app/superset/translations/zh_TW /app/superset/translations/zh-HK && \    
+    chown -R superset:superset /app/superset/translations
 
 
 # 7. 修复 service-worker.js 404
