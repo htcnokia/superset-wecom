@@ -27,7 +27,11 @@ RUN echo "[ODBC Driver 18 for SQL Server]" > /etc/odbcinst.ini \
 # 4. 复制翻译脚本
 COPY scripts/translate_po.py /app/scripts/translate_po.py
 
-# 5. 基于英文补全简体中文翻译
+# 5. 从 Github 下载最新的全量英文词条作为翻译基准
+RUN curl -L https://raw.githubusercontent.com/apache/superset/master/superset/translations/en/LC_MESSAGES/messages.po \
+    -o /app/superset/translations/en/LC_MESSAGES/messages.po
+    
+# 5.0 基于英文补全简体中文翻译
 RUN . /app/.venv/bin/activate && \
     python /app/scripts/translate_po.py \
     --translations-dir /app/superset/translations \
