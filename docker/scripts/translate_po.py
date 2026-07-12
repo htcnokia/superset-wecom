@@ -261,7 +261,64 @@ def should_translate(msgid, blacklist=None):
 # ==========================================
 
 def translate_batch(texts, source_lang='en', target_lang='zh-CN', batch_size=15):
-    """批量翻译"""
+    """批量翻译（支持本地词库优先，并自动适配繁体转换）"""
+    
+    # 1. 定义本地简体词库
+    GLOSSARY = {
+        "Supplier Capacity": "供应商产能维护",
+        "Capacity Date": "产能日期",
+        "Capacity Type": "产能类型",
+        "Capacity Quantity": "产能数量",
+        "Forecast Quantity": "预告订单",
+        "Supply Category": "供应类别",
+        "Style No": "款号",
+        "Color": "颜色",
+        "Data Maintenance": "数据维护",
+        "Dictionary Management": "基础字典管理",
+        "Select Product (Code|Name|Style|Color)": "选择产品 (编码|名称|款号|颜色)",
+        "Select Supplier (ID|Name)": "选择供应商 (编号|名称)",
+        "Select Supplier": "选择供应商",
+        "Bulk Capacity Entry":"批量添加产能信息",
+        "Start Month":"开始月份",
+        "End Month":"结束月份",
+        "Save All Data":"全部保存",
+        "Back to List":"返回列表",
+    }
+
+    # 2. 繁体适配逻辑
+    # 判断目标语言是否为繁体中文 (zh-TW, zh-HK, zh-Hant 等)
+    is_traditional = any(tag in target_lang.lower() for tag in ['tw', 'hk', 'hant'])
+    
+    converter = None
+    if is_traditional:
+        try:
+            import opencc
+            # 使用 s2t (简体到繁体) 转换器
+            converter = opencc.OpenCC('s2t')
+            print(f"  [Info] Target language '{target_lang}' detected as Traditional. Glossary will be converted.")
+        except ImportError:
+            print("  [Warning] opencc not installed, glossary will remain in Simplified Chinese.")
+
+    results = {}
+    to_translate_api = []
+
+    # 3. 预处理：区分本地翻译和需要 API 翻译的词条
+    for text in texts:
+        if target_lang.startswith('zh') and text in GLOSSARY:
+            val = GLOSSARY[text]
+            # 如果目标是繁体，且转换器可用，则转换词库内容
+            if converter:
+                results[text] = converter.convert(val)
+            else:
+                results[text] = val
+        else:
+            to_translate_api.append(text)
+
+    # 如果所有词条都在本地词库中，直接返回
+    if not to_translate_api:
+        return results
+
+    # 4. 执行 API 翻译逻辑
     try:
         from deep_translator import GoogleTranslator
     except ImportError:
@@ -269,22 +326,18 @@ def translate_batch(texts, source_lang='en', target_lang='zh-CN', batch_size=15)
         sys.exit(1)
 
     translator = GoogleTranslator(source=source_lang, target=target_lang)
-    results = {}
-    total = len(texts)
+    total = len(to_translate_api)
 
     for i in range(0, total, batch_size):
-        batch = texts[i:i + batch_size]
+        batch = to_translate_api[i:i + batch_size]
         batch_num = i // batch_size + 1
         total_batches = (total + batch_size - 1) // batch_size
-        print(f"  Batch {batch_num}/{total_batches} ({len(batch)} items)...")
+        print(f"  Batch {batch_num}/{total_batches} ({len(batch)} items from API)...")
 
         try:
             translated = translator.translate_batch(batch)
             for original, translation in zip(batch, translated):
-                if translation:
-                    results[original] = translation
-                else:
-                    results[original] = original
+                results[original] = translation if translation else original
         except Exception as e:
             print(f"  Batch failed: {e}, falling back to single translation...")
             for text in batch:
@@ -300,7 +353,6 @@ def translate_batch(texts, source_lang='en', target_lang='zh-CN', batch_size=15)
             time.sleep(1.5)
 
     return results
-
 
 # ==========================================
 # 4. OpenCC 简繁转换
